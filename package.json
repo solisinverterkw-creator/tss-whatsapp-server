@@ -1,0 +1,11 @@
+{
+  "name": "tss-free-whatsapp-gateway",
+  "version": "1.0.0",
+  "description": "100% Free Unlimited WhatsApp Result Card (Image & PDF) Auto-Sender for The Smart School",
+  "main": "server.js",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4"
+  }
+}

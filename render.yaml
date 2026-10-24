@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: tss-free-whatsapp-server
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    autoDeploy: true
