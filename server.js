@@ -128,6 +128,62 @@ setInterval(() => {
     httpsRequestJson(`${RENDER_SELF_URL}/status?keepalive=1`, 'GET');
 }, 4 * 60 * 1000);
 
+const msgStore = new Map();
+const receiptStore = new Map(); // message_id -> { message_id, phone, status, delivered_at, read_at, updated_at }
+
+function mapAckStatus(ackNum) {
+    // Baileys WAMessageStatus: 0=ERROR, 1=PENDING, 2=SERVER_ACK, 3=DELIVERY_ACK, 4=READ, 5=PLAYED
+    if (ackNum >= 4) return 'read';
+    if (ackNum === 3) return 'delivered';
+    if (ackNum === 2) return 'sent_server';
+    if (ackNum === 0) return 'failed';
+    return '';
+}
+
+function recordAndPushReceipt(msgId, remoteJid, newStatus, errorReason = '') {
+    if (!msgId || !newStatus) return;
+    const rank = { pending: 0, sent_server: 2, delivered: 3, read: 4, failed: 5, not_on_whatsapp: 5 };
+    const cleanPhone = String(remoteJid || '').split('@')[0].split(':')[0].replace(/\D+/g, '');
+    const existing = receiptStore.get(msgId) || {
+        message_id: msgId,
+        phone: cleanPhone,
+        status: 'sent_server',
+        delivered_at: null,
+        read_at: null,
+        updated_at: Date.now()
+    };
+
+    if ((rank[newStatus] || 0) < (rank[existing.status] || 0)) {
+        return;
+    }
+
+    const nowIso = new Date().toISOString();
+    existing.status = newStatus;
+    if (cleanPhone) existing.phone = cleanPhone;
+    if ((newStatus === 'delivered' || newStatus === 'read') && !existing.delivered_at) {
+        existing.delivered_at = nowIso;
+    }
+    if (newStatus === 'read' && !existing.read_at) {
+        existing.read_at = nowIso;
+    }
+    existing.updated_at = Date.now();
+    receiptStore.set(msgId, existing);
+
+    if (receiptStore.size > 5000) {
+        const oldestKey = receiptStore.keys().next().value;
+        receiptStore.delete(oldestKey);
+    }
+
+    // Push live receipt update to School Portal immediately
+    httpsRequestJson(`${PORTAL_SYNC_URL}?action=wa_delivery_webhook&sync_key=${SYNC_KEY}`, 'POST', {
+        sync_key: SYNC_KEY,
+        message_id: msgId,
+        phone: existing.phone,
+        delivery_status: newStatus,
+        error_reason: errorReason || ''
+    }).catch(() => {});
+}
+
 async function startWhatsAppConnection() {
     if (isReconnecting) return;
     isReconnecting = true;
@@ -151,13 +207,50 @@ async function startWhatsAppConnection() {
             logger: pino({ level: 'silent' }),
             browser: ['The Smart School Portal', 'Chrome', '120.0.0'],
             syncFullHistory: false,
-            markOnlineOnConnect: false,
-            keepAliveIntervalMs: 25000
+            markOnlineOnConnect: true,
+            keepAliveIntervalMs: 25000,
+            getMessage: async (key) => {
+                if (key && key.id && msgStore.has(key.id)) {
+                    return msgStore.get(key.id);
+                }
+                return undefined;
+            }
         });
 
         sock.ev.on('creds.update', async () => {
             await saveCreds();
             scheduleSessionBackupToHostinger();
+        });
+
+        // Track 1-Tick (Server), 2-Ticks (Received by Parent), and Blue Ticks (Seen by Parent)
+        sock.ev.on('messages.update', (updates) => {
+            if (!Array.isArray(updates)) return;
+            for (const u of updates) {
+                const msgId = u?.key?.id;
+                const jid = u?.key?.remoteJid;
+                const ack = u?.update?.status;
+                if (msgId && typeof ack === 'number') {
+                    const mapped = mapAckStatus(ack);
+                    if (mapped) {
+                        recordAndPushReceipt(msgId, jid, mapped);
+                    }
+                }
+            }
+        });
+
+        sock.ev.on('message-receipt.update', (receipts) => {
+            if (!Array.isArray(receipts)) return;
+            for (const r of receipts) {
+                const msgId = r?.key?.id;
+                const jid = r?.key?.remoteJid;
+                const rec = r?.receipt || {};
+                if (!msgId) continue;
+                if (rec.readTimestamp || rec.playedTimestamp) {
+                    recordAndPushReceipt(msgId, jid, 'read');
+                } else if (rec.receiptTimestamp) {
+                    recordAndPushReceipt(msgId, jid, 'delivered');
+                }
+            }
         });
 
         sock.ev.on('connection.update', async (update) => {
@@ -209,15 +302,27 @@ async function startWhatsAppConnection() {
     }
 }
 
-function formatJid(rawPhone) {
-    let digits = String(rawPhone || '').replace(/\D+/g, '');
+function normalizePhoneDigits(rawPhone) {
+    let text = String(rawPhone || '').split(/[\/,;|\n]+/)[0] || '';
+    let digits = text.replace(/\D+/g, '');
+    if (digits.length === 22 && digits.startsWith('03')) {
+        digits = digits.slice(0, 11);
+    } else if (digits.length === 24 && digits.startsWith('923')) {
+        digits = digits.slice(0, 12);
+    }
     if (digits.startsWith('00')) digits = digits.slice(2);
-    if (digits.startsWith('03') && digits.length === 11) {
+    if (digits.startsWith('9203') && digits.length === 13) {
+        digits = '92' + digits.slice(3);
+    } else if (digits.startsWith('03') && digits.length === 11) {
         digits = '92' + digits.slice(1);
     } else if (digits.length === 10 && digits.startsWith('3')) {
         digits = '92' + digits;
     }
-    return digits + '@s.whatsapp.net';
+    return digits;
+}
+
+function formatJid(rawPhone) {
+    return normalizePhoneDigits(rawPhone) + '@s.whatsapp.net';
 }
 
 function setCorsHeaders(res) {
@@ -246,7 +351,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         const statusHtml = connectionState === 'authorized'
-            ? `<h2 style="color:#16a34a;">✅ WhatsApp Connected (${connectedNumber}) — 24/7 Cloud Auto-Send Ready!</h2>`
+            ? `<h2 style="color:#16a34a;">✅ WhatsApp Connected (${connectedNumber}) — 24/7 Cloud Auto-Send + Live Receipt Tracking Ready!</h2>`
             : (latestQrDataUrl
                 ? `<h3>📱 Scan this QR Code from your Phone WhatsApp (Linked Devices &rarr; Link a Device):</h3><img src="${latestQrDataUrl}" style="border:2px solid #16a34a;padding:8px;border-radius:12px;"/><p><a href="/" style="padding:8px 16px;background:#16a34a;color:#fff;text-decoration:none;border-radius:6px;">Refresh Status</a></p>`
                 : `<h3>⏳ Generating QR Code... Please refresh in 3 seconds.</h3><script>setTimeout(()=>location.reload(),3000);</script>`);
@@ -260,12 +365,31 @@ const server = http.createServer(async (req, res) => {
             state: connectionState,
             phone: connectedNumber,
             qr_image: latestQrDataUrl,
+            receipts_tracked: receiptStore.size,
             status_msg: connectionState === 'authorized'
-                ? `✅ Free Unlimited WhatsApp Connected (${connectedNumber})! Ready to send 1000+ Result Cards (Image/PDF) 24/7!`
+                ? `✅ Free Unlimited WhatsApp Connected (${connectedNumber})! Ready to send 1000+ Result Cards (Image/PDF) 24/7 with ✓✓ Receipt Tracking!`
                 : (latestQrDataUrl
                     ? '📱 Scan this QR Code from your Phone WhatsApp (Linked Devices -> Link a Device)!'
                     : '⏳ Generating WhatsApp QR Code, please wait 2 seconds and click Refresh...')
         });
+    }
+
+    if (pathname === '/receipts' && req.method === 'GET') {
+        const idsParam = (urlObj.searchParams.get('ids') || '').trim();
+        const out = {};
+        if (idsParam) {
+            for (const id of idsParam.split(',').map(s => s.trim()).filter(Boolean)) {
+                if (receiptStore.has(id)) {
+                    out[id] = receiptStore.get(id);
+                }
+            }
+        } else {
+            const entries = Array.from(receiptStore.entries()).slice(-200);
+            for (const [k, v] of entries) {
+                out[k] = v;
+            }
+        }
+        return sendJson(res, 200, { ok: true, receipts: out });
     }
 
     if (pathname === '/logout' && req.method === 'POST') {
@@ -291,10 +415,17 @@ const server = http.createServer(async (req, res) => {
                 const rawBody = Buffer.concat(bodyChunks).toString('utf8');
                 const data = JSON.parse(rawBody || '{}');
 
+                // If socket is mid-reconnect after Render cold wake-up, wait up to 12 seconds for 'authorized'
+                if (connectionState !== 'authorized') {
+                    for (let w = 0; w < 24 && connectionState !== 'authorized'; w++) {
+                        await new Promise(r => setTimeout(r, 500));
+                    }
+                }
+
                 if (connectionState !== 'authorized' || !sock) {
                     return sendJson(res, 400, {
                         ok: false,
-                        error: 'WhatsApp QR Code is not scanned yet. Click "Auto-Send API & QR Setup" to scan the QR code first.'
+                        error: 'WhatsApp QR Code is not connected yet. Click "Auto-Send API & QR Setup" to check/scan QR code.'
                     });
                 }
 
@@ -304,39 +435,79 @@ const server = http.createServer(async (req, res) => {
                 const mediaBase64 = data.media_base64 || '';
                 const fileName = data.filename || data.media_filename || (mediaFormat === 'pdf' ? 'ResultCard.pdf' : 'ResultCard.png');
 
-                if (!phone) {
-                    return sendJson(res, 400, { ok: false, error: 'Recipient phone number is required.' });
+                const digits = normalizePhoneDigits(phone);
+                if (!digits || digits.length < 10) {
+                    return sendJson(res, 400, { ok: false, error: 'Valid recipient WhatsApp mobile number is required.' });
                 }
 
-                const jid = formatJid(phone);
+                // Verify number on WhatsApp & resolve exact Multi-Device JID (fixes unsaved parent number delivery!)
+                let targetJid = digits + '@s.whatsapp.net';
+                try {
+                    const waCheckArr = await sock.onWhatsApp(digits);
+                    if (Array.isArray(waCheckArr) && waCheckArr.length > 0) {
+                        if (!waCheckArr[0].exists) {
+                            return sendJson(res, 400, {
+                                ok: false,
+                                not_on_whatsapp: true,
+                                phone: digits,
+                                error: `Parent mobile number (+${digits}) is NOT registered on WhatsApp.`
+                            });
+                        }
+                        if (waCheckArr[0].jid) {
+                            targetJid = waCheckArr[0].jid;
+                        }
+                    } else if (Array.isArray(waCheckArr) && waCheckArr.length === 0) {
+                        return sendJson(res, 400, {
+                            ok: false,
+                            not_on_whatsapp: true,
+                            phone: digits,
+                            error: `Parent mobile number (+${digits}) is NOT registered on WhatsApp.`
+                        });
+                    }
+                } catch (chkErr) {
+                    // Proceed with standard JID if lookup times out transiently
+                }
 
+                let sentResult = null;
                 if (mediaBase64) {
                     const cleanB64 = mediaBase64.replace(/^data:[^;]+;base64,/, '');
                     const fileBuffer = Buffer.from(cleanB64, 'base64');
 
                     if (mediaFormat === 'pdf') {
-                        await sock.sendMessage(jid, {
+                        sentResult = await sock.sendMessage(targetJid, {
                             document: fileBuffer,
                             mimetype: 'application/pdf',
                             fileName: fileName.endsWith('.pdf') ? fileName : (fileName + '.pdf'),
                             caption: message
                         });
                     } else {
-                        await sock.sendMessage(jid, {
+                        sentResult = await sock.sendMessage(targetJid, {
                             image: fileBuffer,
                             caption: message
                         });
                     }
                 } else {
-                    await sock.sendMessage(jid, { text: message });
+                    sentResult = await sock.sendMessage(targetJid, { text: message });
                 }
 
-                console.log(`📤 Sent ${mediaBase64 ? mediaFormat.toUpperCase() : 'TEXT'} to ${jid}`);
+                const messageId = (sentResult && sentResult.key && sentResult.key.id) ? sentResult.key.id : '';
+                if (messageId) {
+                    msgStore.set(messageId, sentResult.message);
+                    if (msgStore.size > 3000) {
+                        const firstKey = msgStore.keys().next().value;
+                        msgStore.delete(firstKey);
+                    }
+                    recordAndPushReceipt(messageId, targetJid, 'sent_server');
+                }
+
+                console.log(`📤 Sent ${mediaBase64 ? mediaFormat.toUpperCase() : 'TEXT'} to ${targetJid} [msgId=${messageId}]`);
                 return sendJson(res, 200, {
                     ok: true,
                     api_sent: true,
                     mode: 'api_sent',
-                    phone: jid.split('@')[0]
+                    message_id: messageId,
+                    delivery_status: 'sent_server',
+                    phone: digits
                 });
             } catch (err) {
                 console.error('Send error:', err.message);
