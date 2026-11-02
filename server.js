@@ -37,6 +37,19 @@ let backupTimer = null;
 const verifiedSessionJids = new Set();
 const msgStore = new Map();
 const receiptStore = new Map(); // message_id -> { message_id, phone, status, delivered_at, read_at, updated_at }
+const RETENTION_30D_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Auto-purge any in-memory receipt/message entries older than 30 days (1 Month Retention)
+setInterval(() => {
+    const cutoff = Date.now() - RETENTION_30D_MS;
+    for (const [msgId, rec] of Array.from(receiptStore.entries())) {
+        const ts = rec && rec.updated_at ? Number(rec.updated_at) : 0;
+        if (ts > 0 && ts < cutoff) {
+            receiptStore.delete(msgId);
+            msgStore.delete(msgId);
+        }
+    }
+}, 3600 * 1000).unref();
 
 /**
  * Ephemeral Signal Double-Ratchet files MUST NOT be backed up/restored across cloud restarts!
