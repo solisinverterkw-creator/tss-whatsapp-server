@@ -106,24 +106,34 @@ function withTimeout(promise, ms, label = 'Operation') {
     });
 }
 
-function httpsRequestJson(urlStr, method = 'GET', bodyObj = null) {
+function httpsRequestJson(urlStr, method = 'GET', bodyObj = null, timeoutMs = 45000, redirectsLeft = 3) {
     return new Promise((resolve) => {
         try {
             const u = new URL(urlStr);
             const payload = bodyObj ? Buffer.from(JSON.stringify(bodyObj), 'utf8') : null;
+            const headers = {
+                'User-Agent': 'TSS-WhatsApp-Gateway/2.4 (PermanentSession)',
+                'Accept': 'application/json'
+            };
+            if (payload) {
+                headers['Content-Type'] = 'application/json';
+                headers['Content-Length'] = payload.length;
+            }
             const opts = {
                 hostname: u.hostname,
                 port: u.port || (u.protocol === 'https:' ? 443 : 80),
                 path: u.pathname + u.search,
                 method,
-                headers: payload ? {
-                    'Content-Type': 'application/json',
-                    'Content-Length': payload.length
-                } : {},
-                timeout: 12000
+                headers,
+                timeout: timeoutMs
             };
             const client = u.protocol === 'https:' ? https : http;
             const req = client.request(opts, (res) => {
+                if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
+                    const nextUrl = new URL(res.headers.location, urlStr).toString();
+                    res.resume();
+                    return resolve(httpsRequestJson(nextUrl, method, bodyObj, timeoutMs, redirectsLeft - 1));
+                }
                 let chunks = [];
                 res.on('data', (c) => chunks.push(c));
                 res.on('end', () => {
@@ -144,58 +154,111 @@ function httpsRequestJson(urlStr, method = 'GET', bodyObj = null) {
     });
 }
 
+let phoneUnlinkedByUser = false;
+let consecutiveLoggedOutCount = 0;
+
+/**
+ * Verify that local creds.json actually contains a linked WhatsApp account (me.id),
+ * NOT a blank unauthenticated file created before QR scan!
+ */
+function hasValidLinkedCreds() {
+    try {
+        const credsPath = path.join(AUTH_DIR, 'creds.json');
+        if (!fs.existsSync(credsPath)) return false;
+        const parsed = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+        return Boolean(parsed && parsed.me && parsed.me.id);
+    } catch (e) {
+        return false;
+    }
+}
+
+function writeAuthFilesToDisk(filesObj) {
+    if (!filesObj || typeof filesObj !== 'object') return 0;
+    if (!fs.existsSync(AUTH_DIR)) {
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
+    }
+    let count = 0;
+    for (const [fname, b64] of Object.entries(filesObj)) {
+        const safeName = path.basename(String(fname || ''));
+        if (!safeName || isEphemeralRatchetFile(safeName)) continue;
+        fs.writeFileSync(path.join(AUTH_DIR, safeName), Buffer.from(String(b64), 'base64'));
+        count++;
+    }
+    return count;
+}
+
 async function restoreSessionFromHostinger() {
+    if (phoneUnlinkedByUser) return false;
     try {
         if (!fs.existsSync(AUTH_DIR)) {
             fs.mkdirSync(AUTH_DIR, { recursive: true });
         }
-        const credsPath = path.join(AUTH_DIR, 'creds.json');
-        if (fs.existsSync(credsPath)) {
-            return;
+        if (hasValidLinkedCreds()) {
+            return true;
         }
-        console.log('🔄 Checking Hostinger Cloud Backup for saved WhatsApp QR credentials...');
-        const res = await httpsRequestJson(`${PORTAL_SYNC_URL}?action=wa_session_restore&sync_key=${SYNC_KEY}`, 'GET');
-        if (res && res.ok && res.files && typeof res.files === 'object') {
-            let count = 0;
-            for (const [fname, b64] of Object.entries(res.files)) {
-                const safeName = path.basename(fname);
-                if (isEphemeralRatchetFile(safeName)) continue;
-                fs.writeFileSync(path.join(AUTH_DIR, safeName), Buffer.from(b64, 'base64'));
-                count++;
+        // Remove any blank/unlinked creds.json so it never blocks restoring real linked credentials
+        try {
+            const credsPath = path.join(AUTH_DIR, 'creds.json');
+            if (fs.existsSync(credsPath)) fs.unlinkSync(credsPath);
+        } catch (e) {}
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            console.log(`🔄 [Attempt ${attempt}/3] Restoring permanent WhatsApp QR session from School Portal...`);
+            const res = await httpsRequestJson(`${PORTAL_SYNC_URL}?action=wa_session_restore&sync_key=${SYNC_KEY}`, 'GET', null, 45000);
+            if (res && res.ok && res.files && typeof res.files === 'object' && res.files['creds.json']) {
+                const count = writeAuthFilesToDisk(res.files);
+                if (count > 0 && hasValidLinkedCreds()) {
+                    console.log(`✅ Permanent WhatsApp QR session restored (${count} files) — NO QR re-scan needed!`);
+                    return true;
+                }
             }
-            if (count > 0) {
-                console.log(`✅ Restored ${count} core WhatsApp credential file(s) from Hostinger!`);
+            if (attempt < 3) {
+                await new Promise(r => setTimeout(r, 2500));
             }
         }
     } catch (e) {
         console.error('Session restore warning:', e.message);
     }
+    return false;
 }
 
 function scheduleSessionBackupToHostinger() {
     if (backupTimer) clearTimeout(backupTimer);
     backupTimer = setTimeout(async () => {
         try {
-            if (!fs.existsSync(AUTH_DIR)) return;
-            const credsPath = path.join(AUTH_DIR, 'creds.json');
-            if (!fs.existsSync(credsPath)) return;
+            // NEVER overwrite portal backup unless local creds.json has a valid linked WhatsApp phone (me.id)!
+            if (!hasValidLinkedCreds()) return;
+
             const allFiles = fs.readdirSync(AUTH_DIR);
+            const preKeyFiles = allFiles
+                .filter(f => f.toLowerCase().startsWith('pre-key-'))
+                .sort((a, b) => {
+                    const na = parseInt(a.replace(/\D+/g, '') || '0', 10);
+                    const nb = parseInt(b.replace(/\D+/g, '') || '0', 10);
+                    return nb - na; // newest pre-keys first
+                })
+                .slice(0, 35);
+            const keepPreKeys = new Set(preKeyFiles);
+
             const filesMap = {};
             for (const f of allFiles) {
                 if (isEphemeralRatchetFile(f)) continue;
+                if (f.toLowerCase().startsWith('pre-key-') && !keepPreKeys.has(f)) continue;
                 const full = path.join(AUTH_DIR, f);
                 if (fs.statSync(full).isFile()) {
                     filesMap[f] = fs.readFileSync(full).toString('base64');
                 }
             }
-            await httpsRequestJson(`${PORTAL_SYNC_URL}?action=wa_session_backup&sync_key=${SYNC_KEY}`, 'POST', { files: filesMap });
+            if (!filesMap['creds.json']) return;
+            await httpsRequestJson(`${PORTAL_SYNC_URL}?action=wa_session_backup&sync_key=${SYNC_KEY}`, 'POST', { files: filesMap }, 45000);
         } catch (e) {}
     }, 2500);
 }
 
-async function clearSessionOnHostinger() {
+async function clearSessionOnHostinger(forceLogout = false) {
+    if (!forceLogout) return;
     try {
-        await httpsRequestJson(`${PORTAL_SYNC_URL}?action=wa_session_clear&sync_key=${SYNC_KEY}`, 'POST', {});
+        await httpsRequestJson(`${PORTAL_SYNC_URL}?action=wa_session_clear&sync_key=${SYNC_KEY}&force_logout=1`, 'POST', { force_logout: 1 }, 25000);
     } catch (e) {}
 }
 
@@ -387,10 +450,12 @@ async function startWhatsAppConnection() {
             }
 
             if (connection === 'open') {
+                phoneUnlinkedByUser = false;
+                consecutiveLoggedOutCount = 0;
                 connectionState = 'authorized';
                 latestQrDataUrl = '';
                 connectedNumber = (newSock.user && newSock.user.id) ? newSock.user.id.split(':')[0] : 'Connected';
-                console.log('✅ [WHATSAPP CONNECTED] Number:', connectedNumber, '— Fast Zero-CPU Image & PDF Delivery Ready!');
+                console.log('✅ [WHATSAPP CONNECTED PERMANENTLY] Number:', connectedNumber, '— v2.4 Ready!');
                 try {
                     await newSock.uploadPreKeysToServerIfRequired();
                 } catch (e) {}
@@ -399,23 +464,33 @@ async function startWhatsAppConnection() {
 
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                console.log('⚠️ Connection closed. Status:', statusCode, 'Reconnecting:', shouldReconnect);
+                const isExplicitLogout = statusCode === DisconnectReason.loggedOut;
+                const isReplaced = statusCode === DisconnectReason.connectionReplaced;
+                console.log('⚠️ Connection closed. Status:', statusCode, 'Replaced:', isReplaced, 'LoggedOut:', isExplicitLogout);
                 connectionState = 'disconnected';
                 latestQrDataUrl = '';
 
-                if (!shouldReconnect) {
+                if (isExplicitLogout) {
+                    consecutiveLoggedOutCount++;
                     try {
                         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                     } catch (e) {}
-                    await clearSessionOnHostinger();
+                    // Only stop auto-restoring if WhatsApp rejected the restored session twice in a row (user unlinked from phone)
+                    if (consecutiveLoggedOutCount >= 2) {
+                        phoneUnlinkedByUser = true;
+                    }
+                } else if (statusCode === DisconnectReason.badSession) {
+                    purgeStaleSessionFiles();
                 }
+
+                // Wait 6s on 440 (Render zero-downtime deploy overlap) so retiring container exits cleanly without kicking new container
+                const retryDelayMs = isReplaced ? 6000 : 1800;
                 setTimeout(() => {
                     if (sock === newSock) {
                         isReconnecting = false;
                         startWhatsAppConnection();
                     }
-                }, 1500);
+                }, retryDelayMs);
             }
         });
     } catch (err) {
@@ -496,12 +571,12 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         const statusHtml = connectionState === 'authorized'
-            ? `<h2 style="color:#16a34a;">✅ WhatsApp Connected (${connectedNumber}) — v2.3 Zero-CPU Fast Delivery Ready!</h2>
+            ? `<h2 style="color:#16a34a;">✅ WhatsApp Permanently Connected (${connectedNumber}) — v2.4 Ready!</h2>
                <p><a href="/clear-stuck" style="display:inline-block;margin:6px;padding:10px 18px;background:#0284c7;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">🧹 Clear Stuck Queue &amp; Repair Encryption (Keep QR)</a></p>`
             : (latestQrDataUrl
-                ? `<h3>📱 Scan this QR Code from your Phone WhatsApp (Linked Devices &rarr; Link a Device):</h3><img src="${latestQrDataUrl}" style="border:2px solid #16a34a;padding:8px;border-radius:12px;"/><p><a href="/" style="padding:8px 16px;background:#16a34a;color:#fff;text-decoration:none;border-radius:6px;">Refresh Status</a></p>`
-                : `<h3>⏳ Generating QR Code... Please refresh in 3 seconds.</h3><script>setTimeout(()=>location.reload(),3000);</script>`);
-        return res.end(`<!DOCTYPE html><html><head><title>TSS 24/7 Free WhatsApp Cloud Server</title><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="font-family:sans-serif;text-align:center;padding:30px;"><h1>🏫 The Smart School — 24/7 Free WhatsApp Server v2.3</h1>${statusHtml}</body></html>`);
+                ? `<h3>📱 Scan this QR Code ONCE from your Phone WhatsApp (Linked Devices &rarr; Link a Device):</h3><img src="${latestQrDataUrl}" style="border:2px solid #16a34a;padding:8px;border-radius:12px;"/><p><a href="/" style="padding:8px 16px;background:#16a34a;color:#fff;text-decoration:none;border-radius:6px;">Refresh Status</a></p>`
+                : `<h3>⏳ Restoring Permanent Session / Connecting... Please refresh in 3 seconds.</h3><script>setTimeout(()=>location.reload(),3000);</script>`);
+        return res.end(`<!DOCTYPE html><html><head><title>TSS 24/7 Permanent WhatsApp Cloud Server</title><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="font-family:sans-serif;text-align:center;padding:30px;"><h1>🏫 The Smart School — 24/7 Permanent WhatsApp Server v2.4</h1>${statusHtml}</body></html>`);
     }
 
     if (pathname === '/status' && req.method === 'GET') {
@@ -514,15 +589,17 @@ const server = http.createServer(async (req, res) => {
             connected: connectionState === 'authorized',
             state: connectionState,
             phone: connectedNumber,
+            has_linked_creds: hasValidLinkedCreds(),
+            phone_unlinked_by_user: phoneUnlinkedByUser,
             qr_image: latestQrDataUrl,
             receipts_tracked: receiptStore.size,
             stuck_1tick: stuckCount,
-            gateway_version: '2.3-fast-zerocpu',
+            gateway_version: '2.4-permanent-qr',
             status_msg: connectionState === 'authorized'
-                ? `✅ Free Unlimited WhatsApp Connected (${connectedNumber})! Ready to send Result Cards (Image/PDF) 24/7 with ✓✓ Receipt Tracking!`
+                ? `✅ Permanent WhatsApp Connected (${connectedNumber})! Ready 24/7 — No Re-Scan Needed!`
                 : (latestQrDataUrl
-                    ? '📱 Scan this QR Code from your Phone WhatsApp (Linked Devices -> Link a Device)!'
-                    : '⏳ Generating WhatsApp QR Code, please wait 2 seconds and click Refresh...')
+                    ? '📱 Scan this QR Code ONCE from your Phone WhatsApp (Linked Devices -> Link a Device) — stays permanently saved!'
+                    : '⏳ Restoring saved WhatsApp session, please wait 3 seconds...')
         });
     }
 
@@ -542,6 +619,43 @@ const server = http.createServer(async (req, res) => {
             }
         }
         return sendJson(res, 200, { ok: true, receipts: out });
+    }
+
+    if (pathname === '/restore-session' && req.method === 'POST') {
+        let rsChunks = [];
+        req.on('data', (chunk) => rsChunks.push(chunk));
+        req.on('end', async () => {
+            try {
+                const body = JSON.parse(Buffer.concat(rsChunks).toString('utf8') || '{}');
+                if ((body.sync_key || urlObj.searchParams.get('sync_key')) !== SYNC_KEY) {
+                    return sendJson(res, 403, { ok: false, error: 'Forbidden' });
+                }
+                if (phoneUnlinkedByUser && !body.force) {
+                    return sendJson(res, 200, { ok: false, unlinked: true, message: 'Device was unlinked from phone; fresh QR scan required once.' });
+                }
+                if (body.files && typeof body.files === 'object' && body.files['creds.json']) {
+                    try {
+                        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                    } catch (e) {}
+                    const written = writeAuthFilesToDisk(body.files);
+                    if (written > 0 && hasValidLinkedCreds()) {
+                        phoneUnlinkedByUser = false;
+                        consecutiveLoggedOutCount = 0;
+                        const connectedOk = await recycleSocketAndWait(12000);
+                        return sendJson(res, 200, {
+                            ok: true,
+                            connected: connectedOk,
+                            phone: connectedNumber,
+                            restored_files: written
+                        });
+                    }
+                }
+                return sendJson(res, 400, { ok: false, error: 'No valid creds.json provided' });
+            } catch (err) {
+                return sendJson(res, 500, { ok: false, error: err.message });
+            }
+        });
+        return;
     }
 
     if (pathname === '/clear-stuck' && (req.method === 'POST' || req.method === 'GET')) {
@@ -569,25 +683,40 @@ const server = http.createServer(async (req, res) => {
         });
     }
 
-    if (pathname === '/logout' && (req.method === 'POST' || req.method === 'GET')) {
-        msgStore.clear();
-        receiptStore.clear();
-        verifiedSessionJids.clear();
-        const oldSock = sock;
-        sock = null;
-        try {
-            if (oldSock) await oldSock.logout();
-        } catch (e) {}
-        try {
-            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        } catch (e) {}
-        await clearSessionOnHostinger();
-        connectionState = 'connecting';
-        latestQrDataUrl = '';
-        connectedNumber = '';
-        isReconnecting = false;
-        startWhatsAppConnection();
-        return sendJson(res, 200, { ok: true, message: 'Full session reset complete. Generating fresh QR code...' });
+    if (pathname === '/logout' && req.method === 'POST') {
+        let loChunks = [];
+        req.on('data', (c) => loChunks.push(c));
+        req.on('end', async () => {
+            try {
+                const body = JSON.parse(Buffer.concat(loChunks).toString('utf8') || '{}');
+                const keyProvided = body.sync_key || urlObj.searchParams.get('sync_key') || '';
+                if (keyProvided !== SYNC_KEY) {
+                    return sendJson(res, 403, { ok: false, error: 'Unauthorized logout request blocked.' });
+                }
+                msgStore.clear();
+                receiptStore.clear();
+                verifiedSessionJids.clear();
+                phoneUnlinkedByUser = true;
+                const oldSock = sock;
+                sock = null;
+                try {
+                    if (oldSock) await oldSock.logout();
+                } catch (e) {}
+                try {
+                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                } catch (e) {}
+                await clearSessionOnHostinger(true);
+                connectionState = 'connecting';
+                latestQrDataUrl = '';
+                connectedNumber = '';
+                isReconnecting = false;
+                startWhatsAppConnection();
+                return sendJson(res, 200, { ok: true, message: 'Explicit logout complete. Generating fresh QR code...' });
+            } catch (e) {
+                return sendJson(res, 500, { ok: false, error: e.message });
+            }
+        });
+        return;
     }
 
     if (pathname === '/check-numbers' && req.method === 'POST') {
