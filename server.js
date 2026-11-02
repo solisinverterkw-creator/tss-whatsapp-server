@@ -577,6 +577,88 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true, message: 'Full session reset complete. Generating fresh QR code...' });
     }
 
+    if (pathname === '/check-numbers' && req.method === 'POST') {
+        let chkChunks = [];
+        req.on('data', (chunk) => chkChunks.push(chunk));
+        req.on('end', async () => {
+            try {
+                const body = JSON.parse(Buffer.concat(chkChunks).toString('utf8') || '{}');
+                const rawPhones = Array.isArray(body.phones) ? body.phones : [];
+
+                if (connectionState !== 'authorized') {
+                    for (let w = 0; w < 20 && connectionState !== 'authorized'; w++) {
+                        await new Promise(r => setTimeout(r, 500));
+                    }
+                }
+                if (connectionState !== 'authorized' || !sock) {
+                    return sendJson(res, 400, {
+                        ok: false,
+                        connected: false,
+                        error: 'WhatsApp QR is not connected yet. Please check connection first.'
+                    });
+                }
+
+                const cleanList = [];
+                for (const rp of rawPhones) {
+                    const d = normalizePhoneDigits(rp);
+                    if (d && d.length >= 10 && !cleanList.includes(d)) {
+                        cleanList.push(d);
+                    }
+                }
+
+                const results = {};
+                const batchSize = 25;
+                for (let i = 0; i < cleanList.length; i += batchSize) {
+                    const batch = cleanList.slice(i, i + batchSize);
+                    for (const d of batch) {
+                        results[d] = false;
+                    }
+                    try {
+                        const respArr = await withTimeout(sock.onWhatsApp(...batch), 12000, 'onWhatsAppBatch');
+                        if (Array.isArray(respArr)) {
+                            for (const item of respArr) {
+                                if (item && item.exists && item.jid) {
+                                    const numPart = String(item.jid).split('@')[0].split(':')[0].replace(/\D+/g, '');
+                                    if (numPart) {
+                                        results[numPart] = true;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (batchErr) {
+                        console.warn('Batch onWhatsApp timeout/error, recycling socket:', batchErr.message);
+                        await recycleSocketAndWait(8000);
+                        // Retry this batch once after socket recycle
+                        if (sock && connectionState === 'authorized') {
+                            const retryArr = await withTimeout(sock.onWhatsApp(...batch), 12000, 'onWhatsAppBatchRetry');
+                            if (Array.isArray(retryArr)) {
+                                for (const item of retryArr) {
+                                    if (item && item.exists && item.jid) {
+                                        const numPart = String(item.jid).split('@')[0].split(':')[0].replace(/\D+/g, '');
+                                        if (numPart) {
+                                            results[numPart] = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                return sendJson(res, 200, {
+                    ok: true,
+                    connected: true,
+                    checked_count: cleanList.length,
+                    results
+                });
+            } catch (err) {
+                console.error('Check-numbers error:', err.message);
+                return sendJson(res, 500, { ok: false, error: err.message });
+            }
+        });
+        return;
+    }
+
     if (pathname === '/send' && req.method === 'POST') {
         let bodyChunks = [];
         req.on('data', (chunk) => bodyChunks.push(chunk));
