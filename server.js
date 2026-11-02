@@ -35,18 +35,56 @@ let isReconnecting = false;
 let backupTimer = null;
 
 const verifiedSessionJids = new Set();
+const verifiedJidCache = new Map(); // digits -> { exists, jid, ts }
 const msgStore = new Map();
 const receiptStore = new Map(); // message_id -> { message_id, phone, status, delivered_at, read_at, updated_at }
 const RETENTION_30D_MS = 30 * 24 * 60 * 60 * 1000;
+const JID_CACHE_TTL_MS = 6 * 3600 * 1000;
+
+// Strict Serial FIFO Queue for "One Go" Bulk Sending (prevents Signal ratchet collisions & WhatsApp burst throttling)
+let sendQueueChain = Promise.resolve();
+let sendQueueDepth = 0;
+let lastDispatchedAt = 0;
+let lastDispatchedDigits = '';
+
+function enqueueSendTask(digits, taskFn) {
+    sendQueueDepth++;
+    const run = async () => {
+        try {
+            const now = Date.now();
+            // Enforce 3.5s gap for same parent number (siblings!) and 2.2s gap between different parents
+            const minGapMs = (digits && digits === lastDispatchedDigits) ? 3500 : 2200;
+            const elapsed = now - lastDispatchedAt;
+            if (lastDispatchedAt > 0 && elapsed < minGapMs) {
+                await new Promise(r => setTimeout(r, minGapMs - elapsed));
+            }
+            const res = await taskFn();
+            lastDispatchedAt = Date.now();
+            if (digits) lastDispatchedDigits = digits;
+            return res;
+        } finally {
+            sendQueueDepth = Math.max(0, sendQueueDepth - 1);
+        }
+    };
+    const next = sendQueueChain.then(run, run);
+    sendQueueChain = next.catch(() => {});
+    return next;
+}
 
 // Auto-purge any in-memory receipt/message entries older than 30 days (1 Month Retention)
 setInterval(() => {
     const cutoff = Date.now() - RETENTION_30D_MS;
+    const jidCutoff = Date.now() - JID_CACHE_TTL_MS;
     for (const [msgId, rec] of Array.from(receiptStore.entries())) {
         const ts = rec && rec.updated_at ? Number(rec.updated_at) : 0;
         if (ts > 0 && ts < cutoff) {
             receiptStore.delete(msgId);
             msgStore.delete(msgId);
+        }
+    }
+    for (const [dg, info] of Array.from(verifiedJidCache.entries())) {
+        if (!info || info.ts < jidCutoff) {
+            verifiedJidCache.delete(dg);
         }
     }
 }, 3600 * 1000).unref();
@@ -276,6 +314,17 @@ function mapAckStatus(ackNum) {
     return '';
 }
 
+function pushReceiptWebhook(rec, errorReason = '') {
+    if (!rec || !rec.message_id) return;
+    httpsRequestJson(`${PORTAL_SYNC_URL}?action=wa_delivery_webhook&sync_key=${SYNC_KEY}`, 'POST', {
+        sync_key: SYNC_KEY,
+        message_id: rec.message_id,
+        phone: rec.phone || '',
+        delivery_status: rec.status,
+        error_reason: errorReason || rec.error || ''
+    }).catch(() => {});
+}
+
 function recordAndPushReceipt(msgId, remoteJid, newStatus, errorReason = '') {
     if (!msgId || !newStatus) return;
     const rank = { pending: 0, sent_server: 2, delivered: 3, read: 4, failed: 5, not_on_whatsapp: 5 };
@@ -283,23 +332,31 @@ function recordAndPushReceipt(msgId, remoteJid, newStatus, errorReason = '') {
     const cleanPhone = String(remoteJid || '').split('@')[0].split(':')[0].replace(/\D+/g, '');
     const existing = receiptStore.get(msgId) || {
         message_id: msgId,
-        phone: cleanPhone,
+        phone: isLidJid ? '' : cleanPhone,
+        lid_phone: isLidJid ? cleanPhone : '',
         status: 'sent_server',
         delivered_at: null,
         read_at: null,
         updated_at: Date.now()
     };
 
+    // Always capture real 923... phone number even if a higher-rank @lid receipt arrived 50ms earlier!
+    let phoneUpgradedFromLid = false;
+    if (cleanPhone && !isLidJid && existing.phone !== cleanPhone) {
+        existing.phone = cleanPhone;
+        phoneUpgradedFromLid = true;
+    }
+
     if ((rank[newStatus] || 0) < (rank[existing.status] || 0)) {
+        if (phoneUpgradedFromLid) {
+            receiptStore.set(msgId, existing);
+            pushReceiptWebhook(existing, errorReason);
+        }
         return;
     }
 
     const nowIso = new Date().toISOString();
     existing.status = newStatus;
-    // Keep the real 923... phone number if incoming ACK uses an internal WhatsApp @lid JID
-    if (cleanPhone && (!isLidJid || !existing.phone)) {
-        existing.phone = cleanPhone;
-    }
     if ((newStatus === 'delivered' || newStatus === 'read') && !existing.delivered_at) {
         existing.delivered_at = nowIso;
     }
@@ -317,13 +374,17 @@ function recordAndPushReceipt(msgId, remoteJid, newStatus, errorReason = '') {
         receiptStore.delete(oldestKey);
     }
 
-    httpsRequestJson(`${PORTAL_SYNC_URL}?action=wa_delivery_webhook&sync_key=${SYNC_KEY}`, 'POST', {
-        sync_key: SYNC_KEY,
-        message_id: msgId,
-        phone: existing.phone,
-        delivery_status: newStatus,
-        error_reason: errorReason || ''
-    }).catch(() => {});
+    pushReceiptWebhook(existing, errorReason);
+
+    // Follow-up push 3.8s later for delivered/read so if PHP was still inserting whatsapp_logs at T+0.3s, it gets updated!
+    if (newStatus === 'delivered' || newStatus === 'read') {
+        setTimeout(() => {
+            const latest = receiptStore.get(msgId);
+            if (latest && (latest.status === 'delivered' || latest.status === 'read')) {
+                pushReceiptWebhook(latest);
+            }
+        }, 3800).unref();
+    }
 }
 
 let cachedWaVersion = null;
@@ -594,9 +655,10 @@ const server = http.createServer(async (req, res) => {
             qr_image: latestQrDataUrl,
             receipts_tracked: receiptStore.size,
             stuck_1tick: stuckCount,
-            gateway_version: '2.4-permanent-qr',
+            queue_depth: sendQueueDepth,
+            gateway_version: '2.5-onego-queue',
             status_msg: connectionState === 'authorized'
-                ? `✅ Permanent WhatsApp Connected (${connectedNumber})! Ready 24/7 — No Re-Scan Needed!`
+                ? `✅ Permanent WhatsApp Connected (${connectedNumber})! Ready 24/7 — Smooth One-Go Queue Active!`
                 : (latestQrDataUrl
                     ? '📱 Scan this QR Code ONCE from your Phone WhatsApp (Linked Devices -> Link a Device) — stays permanently saved!'
                     : '⏳ Restoring saved WhatsApp session, please wait 3 seconds...')
@@ -809,19 +871,6 @@ const server = http.createServer(async (req, res) => {
                 const rawBody = Buffer.concat(bodyChunks).toString('utf8');
                 const data = JSON.parse(rawBody || '{}');
 
-                if (connectionState !== 'authorized') {
-                    for (let w = 0; w < 28 && connectionState !== 'authorized'; w++) {
-                        await new Promise(r => setTimeout(r, 500));
-                    }
-                }
-
-                if (connectionState !== 'authorized' || !sock) {
-                    return sendJson(res, 400, {
-                        ok: false,
-                        error: 'WhatsApp QR Code is not connected yet. Click "Auto-Send API & QR Setup" -> "Scan QR / Check Connection".'
-                    });
-                }
-
                 const phone = data.phone || '';
                 const message = data.message || '';
                 const mediaFormat = (data.media_format || 'image').toLowerCase();
@@ -835,42 +884,7 @@ const server = http.createServer(async (req, res) => {
                     return sendJson(res, 400, { ok: false, error: 'Valid recipient WhatsApp mobile number is required.' });
                 }
 
-                // 1. Verify number on WhatsApp with fast 8s timeout (auto-recycles socket if zombie!)
-                let targetJid = digits + '@s.whatsapp.net';
-                try {
-                    const waCheckArr = await withTimeout(sock.onWhatsApp(digits), 8000, 'onWhatsApp');
-                    if (Array.isArray(waCheckArr) && waCheckArr.length > 0) {
-                        if (!waCheckArr[0].exists) {
-                            return sendJson(res, 400, {
-                                ok: false,
-                                not_on_whatsapp: true,
-                                phone: digits,
-                                error: `Parent mobile number (+${digits}) is NOT registered on WhatsApp.`
-                            });
-                        }
-                        if (waCheckArr[0].jid) {
-                            targetJid = typeof jidNormalizedUser === 'function'
-                                ? jidNormalizedUser(waCheckArr[0].jid)
-                                : waCheckArr[0].jid;
-                        }
-                    } else if (Array.isArray(waCheckArr) && waCheckArr.length === 0) {
-                        return sendJson(res, 400, {
-                            ok: false,
-                            not_on_whatsapp: true,
-                            phone: digits,
-                            error: `Parent mobile number (+${digits}) is NOT registered on WhatsApp.`
-                        });
-                    }
-                } catch (chkErr) {
-                    console.warn('onWhatsApp slow/stale, recycling socket cleanly:', chkErr.message);
-                    await recycleSocketAndWait(10000);
-                }
-
-                if (forceFresh) {
-                    purgeStaleSessionFiles(digits);
-                }
-
-                // 2. Build Zero-CPU payload (jpegThumbnail bypasses pure-JS Jimp 1.7MP PNG decode that froze Render 0.1 vCPU!)
+                // Build Zero-CPU payload up front (jpegThumbnail bypasses pure-JS Jimp 1.7MP PNG decode!)
                 let contentPayload;
                 if (mediaBase64) {
                     const cleanB64 = mediaBase64.replace(/^data:[^;]+;base64,/, '');
@@ -889,7 +903,7 @@ const server = http.createServer(async (req, res) => {
                             image: fileBuffer,
                             mimetype: 'image/png',
                             caption: message,
-                            jpegThumbnail: jpegThumbB64, // Always string ('' or base64 JPEG) so Baileys skips Jimp CPU freeze!
+                            jpegThumbnail: jpegThumbB64,
                             ...(dims ? { width: dims.width, height: dims.height } : {})
                         };
                     }
@@ -897,65 +911,161 @@ const server = http.createServer(async (req, res) => {
                     contentPayload = { text: message };
                 }
 
-                // 3. Dispatch with automatic socket self-heal retry if mediaConn or WebSocket timed out
-                let sentResult = null;
-                let lastSendErr = null;
-                for (let attempt = 1; attempt <= 2; attempt++) {
-                    try {
-                        if (!sock || connectionState !== 'authorized') {
-                            await recycleSocketAndWait(10000);
-                        }
-                        sentResult = await withTimeout(sock.sendMessage(targetJid, contentPayload), 28000, 'sendMessage');
-                        lastSendErr = null;
-                        break;
-                    } catch (sendErr) {
-                        lastSendErr = sendErr;
-                        console.warn(`Send attempt ${attempt} error (${sendErr.message}) — recycling socket...`);
-                        if (attempt === 1) {
-                            await recycleSocketAndWait(10000);
+                // Serialize every dispatch through FIFO queue so One-Go bulk messages NEVER collide on Signal ratchet or trigger WhatsApp burst block!
+                const queueOutcome = await enqueueSendTask(digits, async () => {
+                    if (connectionState !== 'authorized') {
+                        for (let w = 0; w < 28 && connectionState !== 'authorized'; w++) {
+                            await new Promise(r => setTimeout(r, 500));
                         }
                     }
-                }
 
-                if (lastSendErr) {
-                    throw lastSendErr;
-                }
+                    if (connectionState !== 'authorized' || !sock) {
+                        return {
+                            httpStatus: 400,
+                            body: {
+                                ok: false,
+                                error: 'WhatsApp QR Code is not connected yet. Click "Auto-Send API & QR Setup" -> "Check Connection / Restore Saved QR".'
+                            }
+                        };
+                    }
 
-                const messageId = (sentResult && sentResult.key && sentResult.key.id) ? sentResult.key.id : '';
-                if (messageId) {
-                    if (sentResult.message) {
-                        msgStore.set(messageId, sentResult.message);
-                        if (msgStore.size > 3000) {
-                            const firstKey = msgStore.keys().next().value;
-                            msgStore.delete(firstKey);
+                    // 1. Fast JID Lookup (uses 6h cache first so siblings & bulk loops don't hammer WhatsApp directory!)
+                    let targetJid = digits + '@s.whatsapp.net';
+                    const cachedJid = verifiedJidCache.get(digits);
+                    if (cachedJid && (Date.now() - cachedJid.ts) < JID_CACHE_TTL_MS) {
+                        if (!cachedJid.exists) {
+                            return {
+                                httpStatus: 400,
+                                body: {
+                                    ok: false,
+                                    not_on_whatsapp: true,
+                                    phone: digits,
+                                    error: `Parent mobile number (+${digits}) is NOT registered on WhatsApp.`
+                                }
+                            };
+                        }
+                        targetJid = cachedJid.jid || targetJid;
+                    } else {
+                        try {
+                            const waCheckArr = await withTimeout(sock.onWhatsApp(digits), 7000, 'onWhatsApp');
+                            if (Array.isArray(waCheckArr) && waCheckArr.length > 0) {
+                                if (!waCheckArr[0].exists) {
+                                    verifiedJidCache.set(digits, { exists: false, jid: '', ts: Date.now() });
+                                    return {
+                                        httpStatus: 400,
+                                        body: {
+                                            ok: false,
+                                            not_on_whatsapp: true,
+                                            phone: digits,
+                                            error: `Parent mobile number (+${digits}) is NOT registered on WhatsApp.`
+                                        }
+                                    };
+                                }
+                                if (waCheckArr[0].jid) {
+                                    targetJid = typeof jidNormalizedUser === 'function'
+                                        ? jidNormalizedUser(waCheckArr[0].jid)
+                                        : waCheckArr[0].jid;
+                                }
+                                verifiedJidCache.set(digits, { exists: true, jid: targetJid, ts: Date.now() });
+                            } else if (Array.isArray(waCheckArr) && waCheckArr.length === 0) {
+                                verifiedJidCache.set(digits, { exists: false, jid: '', ts: Date.now() });
+                                return {
+                                    httpStatus: 400,
+                                    body: {
+                                        ok: false,
+                                        not_on_whatsapp: true,
+                                        phone: digits,
+                                        error: `Parent mobile number (+${digits}) is NOT registered on WhatsApp.`
+                                    }
+                                };
+                            }
+                        } catch (chkErr) {
+                            // IMPORTANT: Do NOT kill active WebSocket during One-Go bulk just because onWhatsApp was slow!
+                            // Tearing down the socket mid-bulk drops pending retry handshakes for previously sent messages!
+                            console.warn('onWhatsApp query slow, proceeding with standard JID without dropping socket:', chkErr.message);
                         }
                     }
-                    // Pass digits + '@s.whatsapp.net' first so real phone number is stored before any @lid receipt arrives
-                    recordAndPushReceipt(messageId, digits + '@s.whatsapp.net', 'sent_server');
 
-                    // Wait up to 3.0s for instant DELIVERY_ACK (2 Ticks) from parent's phone
-                    for (let w = 0; w < 12; w++) {
-                        const recNow = receiptStore.get(messageId);
-                        if (recNow && (recNow.status === 'delivered' || recNow.status === 'read')) {
+                    if (forceFresh) {
+                        purgeStaleSessionFiles(digits);
+                        verifiedSessionJids.delete(targetJid);
+                    }
+
+                    // 2. Pre-warm Signal Multi-Device PreKey session for first-time parents so messages don't stall on 1-Tick!
+                    if (!verifiedSessionJids.has(targetJid) && sock && typeof sock.assertSessions === 'function') {
+                        try {
+                            await withTimeout(sock.assertSessions([targetJid], false), 5000, 'assertSessions');
+                            verifiedSessionJids.add(targetJid);
+                        } catch (sessErr) {
+                            // Non-fatal: Baileys sendMessage will still fetch session if needed
+                        }
+                    }
+
+                    // 3. Dispatch with automatic socket self-heal ONLY if sendMessage itself fails
+                    let sentResult = null;
+                    let lastSendErr = null;
+                    for (let attempt = 1; attempt <= 2; attempt++) {
+                        try {
+                            if (!sock || connectionState !== 'authorized') {
+                                await recycleSocketAndWait(10000);
+                            }
+                            sentResult = await withTimeout(sock.sendMessage(targetJid, contentPayload), 28000, 'sendMessage');
+                            verifiedSessionJids.add(targetJid);
+                            lastSendErr = null;
                             break;
+                        } catch (sendErr) {
+                            lastSendErr = sendErr;
+                            console.warn(`Send attempt ${attempt} error (${sendErr.message}) — recycling socket...`);
+                            if (attempt === 1) {
+                                await recycleSocketAndWait(10000);
+                            }
                         }
-                        await new Promise(r => setTimeout(r, 250));
                     }
-                }
 
-                const finalRec = messageId ? receiptStore.get(messageId) : null;
-                const finalStatus = (finalRec && finalRec.status) ? finalRec.status : 'sent_server';
+                    if (lastSendErr) {
+                        throw lastSendErr;
+                    }
 
-                console.log(`📤 Sent ${mediaBase64 ? mediaFormat.toUpperCase() : 'TEXT'} to ${targetJid} [msgId=${messageId}, status=${finalStatus}]`);
-                return sendJson(res, 200, {
-                    ok: true,
-                    api_sent: true,
-                    mode: 'api_sent',
-                    message_id: messageId,
-                    delivery_status: finalStatus,
-                    delivered_at: finalRec ? finalRec.delivered_at : null,
-                    phone: digits
+                    const messageId = (sentResult && sentResult.key && sentResult.key.id) ? sentResult.key.id : '';
+                    if (messageId) {
+                        if (sentResult.message) {
+                            msgStore.set(messageId, sentResult.message);
+                            if (msgStore.size > 3000) {
+                                const firstKey = msgStore.keys().next().value;
+                                msgStore.delete(firstKey);
+                            }
+                        }
+                        recordAndPushReceipt(messageId, digits + '@s.whatsapp.net', 'sent_server');
+
+                        // Wait up to 2.25s for fast DELIVERY_ACK (2 Ticks); slower ACKs are pushed via webhook + 3.8s follow-up!
+                        for (let w = 0; w < 9; w++) {
+                            const recNow = receiptStore.get(messageId);
+                            if (recNow && (recNow.status === 'delivered' || recNow.status === 'read')) {
+                                break;
+                            }
+                            await new Promise(r => setTimeout(r, 250));
+                        }
+                    }
+
+                    const finalRec = messageId ? receiptStore.get(messageId) : null;
+                    const finalStatus = (finalRec && finalRec.status) ? finalRec.status : 'sent_server';
+
+                    console.log(`📤 Sent ${mediaBase64 ? mediaFormat.toUpperCase() : 'TEXT'} to ${targetJid} [msgId=${messageId}, status=${finalStatus}, queueLeft=${sendQueueDepth - 1}]`);
+                    return {
+                        httpStatus: 200,
+                        body: {
+                            ok: true,
+                            api_sent: true,
+                            mode: 'api_sent',
+                            message_id: messageId,
+                            delivery_status: finalStatus,
+                            delivered_at: finalRec ? finalRec.delivered_at : null,
+                            phone: digits
+                        }
+                    };
                 });
+
+                return sendJson(res, queueOutcome.httpStatus, queueOutcome.body);
             } catch (err) {
                 console.error('Send error:', err.message);
                 return sendJson(res, 500, { ok: false, error: err.message });
@@ -969,8 +1079,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, BIND_HOST, () => {
     console.log('======================================================================');
-    console.log(` 🏫 THE SMART SCHOOL — FREE UNLIMITED WHATSAPP SERVER v2.3 (PORT ${PORT})`);
-    console.log(' ✅ Zero-CPU Image FastPath • Auto Self-Heal • Live ✓✓ Receipt Tracking');
+    console.log(` 🏫 THE SMART SCHOOL — PERMANENT WHATSAPP SERVER v2.5 (PORT ${PORT})`);
+    console.log(' ✅ Permanent QR • Smooth One-Go FIFO Queue • Zero-CPU Image FastPath');
     console.log('======================================================================');
     startWhatsAppConnection();
 });
